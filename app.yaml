@@ -1,0 +1,17 @@
+name: discord-bot
+services:
+- name: web
+  github:
+    repo: Guys-aa/DiscordBOT
+  run_command: python main.py
+  environment_slug: python
+  instance_count: 1
+  instance_size_slug: basic-xxs
+  build_command: pip install -r requirements.txt
+  envs:
+  - key: DISCORD_TOKEN
+    value: ${DISCORD_TOKEN}
+  - key: GITHUB_GPT4O_KEYS
+    value: ${GITHUB_GPT4O_KEYS}
+  - key: GITHUB_DEEPSEEK_KEYS
+    value: ${GITHUB_DEEPSEEK_KEYS}
