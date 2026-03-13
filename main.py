@@ -39,6 +39,51 @@ key_indexes = {"gpt-4o-mini": 0, "deepseek": 0}
 # 会話履歴を保持する辞書 {user_id: [messages]}
 user_histories = {}
 MAX_HISTORY = 10 # 保存する直近のメッセージ数
+VERIFIED_ROLE_NAME = "Verified"  # 認証ボタンが付与するロール名
+
+
+async def ensure_verified_role(guild: discord.Guild):
+    """Ensure the verification role exists; create it if missing."""
+    for role in guild.roles:
+        if role.name.lower() == VERIFIED_ROLE_NAME.lower():
+            return role
+    try:
+        return await guild.create_role(name=VERIFIED_ROLE_NAME, reason="Verification button setup")
+    except discord.Forbidden:
+        return None
+    except Exception as e:
+        print(f"⚠️ ロール作成エラー: {e}")
+        return None
+
+
+class VerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="認証する", style=discord.ButtonStyle.success, custom_id="verify_button")
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("サーバー内でのみ利用できます。", ephemeral=True)
+            return
+
+        role = await ensure_verified_role(guild)
+        if role is None:
+            await interaction.response.send_message("❌ Botにロール作成/付与権限がありません。", ephemeral=True)
+            return
+
+        member = interaction.user
+        if role in member.roles:
+            await interaction.response.send_message("すでに認証済みです。", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role, reason="Verification button")
+            await interaction.response.send_message("✅ 認証しました！", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ ロールを付与できません。Botの権限とロール順位を確認してください。", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ エラー: {e}", ephemeral=True)
 
 def get_ai_client(model_type):
     global key_indexes
@@ -69,6 +114,8 @@ async def on_ready():
     print(f'✅ ログイン: {bot.user.name}')
     print(f'🆔 Bot ID: {bot.user.id}')
     print(f'📡 接続サーバー数: {len(bot.guilds)}')
+    # 永続ビューを登録（再起動後も認証ボタンを動かす）
+    bot.add_view(VerificationView())
     
     # スラッシュコマンドを同期 (重複解消バージョン)
     try:
@@ -118,7 +165,7 @@ async def send_help(interaction: discord.Interaction):
     embed.add_field(name="💻 Developers", value="`/code`, `/github`, `/mermaid`, `/json`, `/hash`, `/password_gen` ", inline=False)
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
-    embed.add_field(name="🛠️ Utility", value="`/remind`, `/poll`, `/clear`, `/say` ", inline=False)
+    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
     embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
@@ -462,6 +509,42 @@ async def calc_slash(interaction: discord.Interaction, expression: str):
     else: await interaction.response.send_message("❌ 安全でない文字が含まれています。")
 
 # ===== 実用ツール (スラッシュ対応) =====
+
+@bot.tree.command(name='setup_verify', description='認証ボタンを設置（サーバー所有者のみ）')
+@app_commands.describe(channel='設置先チャンネル（未指定なら現在のチャンネル）', description_text='案内文（省略可）')
+async def setup_verify_slash(interaction: discord.Interaction, channel: discord.TextChannel = None, description_text: str = "ルールを読んだら下のボタンを押してください。"):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
+        return
+    if interaction.user.id != guild.owner_id:
+        await interaction.response.send_message("このコマンドはサーバー所有者のみ実行できます。", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    me = guild.me
+    if not target_channel.permissions_for(me).send_messages:
+        await interaction.response.send_message("指定チャンネルでメッセージを送信できません。Botの権限を確認してください。", ephemeral=True)
+        return
+    if not me.guild_permissions.manage_roles:
+        await interaction.response.send_message("Botに`ロールの管理`権限がありません。付与してください。", ephemeral=True)
+        return
+
+    role = await ensure_verified_role(guild)
+    if role is None:
+        await interaction.response.send_message("ロールを作成/参照できません。Botの権限とロール位置を確認してください。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="✅ サーバー認証",
+        description=description_text,
+        color=0x57F287
+    )
+    embed.set_footer(text=f"ボタンを押すと「{role.name}」ロールが付与されます。")
+    view = VerificationView()
+    await target_channel.send(embed=embed, view=view)
+    await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました。付与ロール: `{role.name}`", ephemeral=True)
+
 
 @bot.tree.command(name='remind', description='リマインダーを設定します')
 async def remind_slash(interaction: discord.Interaction, minutes: int, message: str):
