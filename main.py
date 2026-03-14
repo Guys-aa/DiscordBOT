@@ -142,11 +142,12 @@ class VerificationView(discord.ui.View):
 
 
 class ProductView(discord.ui.View):
-    def __init__(self, product_id: str, stock_text: str, buy_url: str | None):
+    def __init__(self, product_id: str, stock_text: str, buy_url: str | None, options: list[str]):
         super().__init__(timeout=None)
         self.product_id = product_id
         self.stock_text = stock_text
         self.buy_url = buy_url
+        self.options = options or []
 
         buy_button = discord.ui.Button(
             label="購入する",
@@ -160,12 +161,28 @@ class ProductView(discord.ui.View):
         )
 
         async def on_buy(interaction: discord.Interaction):
-            if self.buy_url:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(label="購入ページを開く", style=discord.ButtonStyle.link, url=self.buy_url))
-                await interaction.response.send_message("購入ページはこちら", view=view, ephemeral=True)
-            else:
-                await interaction.response.send_message("購入リンクは設定されていません。管理者にお問い合わせください。", ephemeral=True)
+            if not self.options:
+                await interaction.response.send_message("商品リストが見つかりません。管理者にお問い合わせください。", ephemeral=True)
+                return
+
+            select = discord.ui.Select(
+                placeholder="購入する商品を選択してください",
+                options=[discord.SelectOption(label=opt[:100], value=opt[:100]) for opt in self.options][:25]
+            )
+
+            async def on_select(select_interaction: discord.Interaction):
+                content = f"選択: **{select.values[0]}**"
+                if self.buy_url:
+                    view = discord.ui.View()
+                    view.add_item(discord.ui.Button(label="購入ページを開く", style=discord.ButtonStyle.link, url=self.buy_url))
+                    await select_interaction.response.send_message(content, view=view, ephemeral=True)
+                else:
+                    await select_interaction.response.send_message(f"{content}\n購入リンクは設定されていません。管理者にお問い合わせください。", ephemeral=True)
+
+            select.callback = on_select
+            view = discord.ui.View()
+            view.add_item(select)
+            await interaction.response.send_message("購入する商品を選択してください。", view=view, ephemeral=True)
 
         async def on_stock(interaction: discord.Interaction):
             await interaction.response.send_message(f"在庫情報: {self.stock_text}", ephemeral=True)
@@ -208,7 +225,7 @@ async def on_ready():
     for role_id in load_verify_role_ids():
         bot.add_view(VerificationView(role_id))
     for pid, pdata in load_product_configs().items():
-        bot.add_view(ProductView(pid, pdata.get("stock_text", "在庫未設定"), pdata.get("buy_url")))
+        bot.add_view(ProductView(pid, pdata.get("stock_text", "在庫未設定"), pdata.get("buy_url"), pdata.get("options", [])))
     
     # スラッシュコマンドを同期 (重複解消バージョン)
     try:
@@ -638,7 +655,7 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
         return
 
     embed = discord.Embed(
-        title="私はロボットではありません",
+        title="認証",
         description=f"```\n{description_text}\n```",
         color=0x57F287
     )
@@ -658,6 +675,7 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
     price='価格テキスト (例: 1200円)',
     stock_text='在庫情報 (例: 在庫あり/残り3など)',
     buy_url='購入リンク (省略可)',
+    options='購入時に選択させる商品リスト（改行区切り）',
     image_url='画像URL (省略可)',
     channel='投稿先チャンネル (省略可)'
 )
@@ -668,6 +686,7 @@ async def post_product_slash(
     price: str,
     stock_text: str,
     buy_url: str = None,
+    options: str = None,
     image_url: str = None,
     channel: discord.TextChannel = None
 ):
@@ -686,15 +705,19 @@ async def post_product_slash(
         return
 
     product_id = str(int(datetime.datetime.now().timestamp() * 1000))
+    option_list = [opt.strip() for opt in (options.splitlines() if options else []) if opt.strip()]
+    if not option_list:
+        option_list = [title]
+
     embed = discord.Embed(title=title, description=body, color=0x2b2d31)
     embed.add_field(name="料金", value=f"```\n{price}\n```", inline=False)
     if image_url:
         embed.set_image(url=image_url)
-    embed.set_footer(text="Developer @bot")
+    embed.set_footer(text="Developer @pri_m123")
 
-    view = ProductView(product_id, stock_text, buy_url)
+    view = ProductView(product_id, stock_text, buy_url, option_list)
     bot.add_view(view)
-    persist_product_config(product_id, {"stock_text": stock_text, "buy_url": buy_url})
+    persist_product_config(product_id, {"stock_text": stock_text, "buy_url": buy_url, "options": option_list})
     await target_channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"{target_channel.mention} に商品カードを投稿しました。", ephemeral=True)
 
