@@ -41,6 +41,7 @@ user_histories = {}
 MAX_HISTORY = 10 # 保存する直近のメッセージ数
 VERIFIED_ROLE_NAME = "Verified"  # 役割未指定時に自動作成するロール名
 VERIFY_CONFIG_FILE = "verify_buttons.json"  # ボタンが紐づくロールIDの保存先
+PRODUCT_CONFIG_FILE = "product_buttons.json"  # 商品ボタンの状態保存
 
 
 def load_verify_role_ids():
@@ -65,6 +66,27 @@ def persist_verify_role_id(role_id: int):
             json.dump(list(current), f)
     except Exception as e:
         print(f"⚠️ 認証ボタン設定の保存に失敗しました: {e}")
+
+
+def load_product_configs():
+    try:
+        with open(PRODUCT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ 商品ボタン設定の読み込みに失敗しました: {e}")
+        return {}
+
+
+def persist_product_config(product_id: str, data: dict):
+    try:
+        current = load_product_configs()
+        current[product_id] = data
+        with open(PRODUCT_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(current, f)
+    except Exception as e:
+        print(f"⚠️ 商品ボタン設定の保存に失敗しました: {e}")
 
 
 async def ensure_verified_role(guild: discord.Guild):
@@ -118,6 +140,41 @@ class VerificationView(discord.ui.View):
         button.callback = on_click
         self.add_item(button)
 
+
+class ProductView(discord.ui.View):
+    def __init__(self, product_id: str, stock_text: str, buy_url: str | None):
+        super().__init__(timeout=None)
+        self.product_id = product_id
+        self.stock_text = stock_text
+        self.buy_url = buy_url
+
+        buy_button = discord.ui.Button(
+            label="購入する",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"product_buy:{product_id}"
+        )
+        stock_button = discord.ui.Button(
+            label="在庫確認",
+            style=discord.ButtonStyle.success,
+            custom_id=f"product_stock:{product_id}"
+        )
+
+        async def on_buy(interaction: discord.Interaction):
+            if self.buy_url:
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(label="購入ページを開く", style=discord.ButtonStyle.link, url=self.buy_url))
+                await interaction.response.send_message("購入ページはこちら", view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message("購入リンクは設定されていません。管理者にお問い合わせください。", ephemeral=True)
+
+        async def on_stock(interaction: discord.Interaction):
+            await interaction.response.send_message(f"在庫情報: {self.stock_text}", ephemeral=True)
+
+        buy_button.callback = on_buy
+        stock_button.callback = on_stock
+        self.add_item(buy_button)
+        self.add_item(stock_button)
+
 def get_ai_client(model_type):
     global key_indexes
     keys = GPT4O_MINI_KEYS if model_type == "gpt-4o-mini" else DEEPSEEK_KEYS
@@ -150,6 +207,8 @@ async def on_ready():
     # 永続ビューを再登録（再起動後も認証ボタンを動かす）
     for role_id in load_verify_role_ids():
         bot.add_view(VerificationView(role_id))
+    for pid, pdata in load_product_configs().items():
+        bot.add_view(ProductView(pid, pdata.get("stock_text", "在庫未設定"), pdata.get("buy_url")))
     
     # スラッシュコマンドを同期 (重複解消バージョン)
     try:
@@ -199,7 +258,7 @@ async def send_help(interaction: discord.Interaction):
     embed.add_field(name="💻 Developers", value="`/code`, `/github`, `/mermaid`, `/json`, `/hash`, `/password_gen` ", inline=False)
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
-    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
+    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/post_product`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
     embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
@@ -579,16 +638,65 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
         return
 
     embed = discord.Embed(
-        title="✅ サーバー認証",
-        description=description_text,
+        title="私はロボットではありません",
+        description=f"```\n{description_text}\n```",
         color=0x57F287
     )
+    embed.set_image(url="https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=80")
     embed.set_footer(text=f"ボタンを押すと「{target_role.name}」ロールが付与されます。")
     view = VerificationView(target_role.id)
     bot.add_view(view)  # 永続ビューとして登録
     persist_verify_role_id(target_role.id)
     await target_channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました。付与ロール: `{target_role.name}`", ephemeral=True)
+
+
+@bot.tree.command(name='post_product', description='商品カードを投稿します（所有者のみ）')
+@app_commands.describe(
+    title='商品名/見出し',
+    body='説明文',
+    price='価格テキスト (例: 1200円)',
+    stock_text='在庫情報 (例: 在庫あり/残り3など)',
+    buy_url='購入リンク (省略可)',
+    image_url='画像URL (省略可)',
+    channel='投稿先チャンネル (省略可)'
+)
+async def post_product_slash(
+    interaction: discord.Interaction,
+    title: str,
+    body: str,
+    price: str,
+    stock_text: str,
+    buy_url: str = None,
+    image_url: str = None,
+    channel: discord.TextChannel = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
+        return
+    if interaction.user.id != guild.owner_id:
+        await interaction.response.send_message("このコマンドはサーバー所有者のみ実行できます。", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    me = guild.me
+    if not target_channel.permissions_for(me).send_messages:
+        await interaction.response.send_message("指定チャンネルでメッセージを送信できません。Botの権限を確認してください。", ephemeral=True)
+        return
+
+    product_id = str(int(datetime.datetime.now().timestamp() * 1000))
+    embed = discord.Embed(title=title, description=body, color=0x2b2d31)
+    embed.add_field(name="料金", value=f"```\n{price}\n```", inline=False)
+    if image_url:
+        embed.set_image(url=image_url)
+    embed.set_footer(text="Developer @bot")
+
+    view = ProductView(product_id, stock_text, buy_url)
+    bot.add_view(view)
+    persist_product_config(product_id, {"stock_text": stock_text, "buy_url": buy_url})
+    await target_channel.send(embed=embed, view=view)
+    await interaction.response.send_message(f"{target_channel.mention} に商品カードを投稿しました。", ephemeral=True)
 
 
 @bot.tree.command(name='remind', description='リマインダーを設定します')
