@@ -39,11 +39,36 @@ key_indexes = {"gpt-4o-mini": 0, "deepseek": 0}
 # 会話履歴を保持する辞書 {user_id: [messages]}
 user_histories = {}
 MAX_HISTORY = 10 # 保存する直近のメッセージ数
-VERIFIED_ROLE_NAME = "Verified"  # 認証ボタンが付与するロール名
+VERIFIED_ROLE_NAME = "Verified"  # 役割未指定時に自動作成するロール名
+VERIFY_CONFIG_FILE = "verify_buttons.json"  # ボタンが紐づくロールIDの保存先
+
+
+def load_verify_role_ids():
+    try:
+        with open(VERIFY_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(int(x) for x in data)
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print(f"⚠️ 認証ボタン設定の読み込みに失敗しました: {e}")
+        return set()
+
+
+def persist_verify_role_id(role_id: int):
+    current = load_verify_role_ids()
+    if role_id in current:
+        return
+    current.add(role_id)
+    try:
+        with open(VERIFY_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(current), f)
+    except Exception as e:
+        print(f"⚠️ 認証ボタン設定の保存に失敗しました: {e}")
 
 
 async def ensure_verified_role(guild: discord.Guild):
-    """Ensure the verification role exists; create it if missing."""
+    """Ensure the default verification role exists; create it if missing."""
     for role in guild.roles:
         if role.name.lower() == VERIFIED_ROLE_NAME.lower():
             return role
@@ -57,33 +82,41 @@ async def ensure_verified_role(guild: discord.Guild):
 
 
 class VerificationView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, role_id: int):
         super().__init__(timeout=None)
+        self.role_id = role_id
+        button = discord.ui.Button(
+            label="認証する",
+            style=discord.ButtonStyle.success,
+            custom_id=f"verify_button:{role_id}"
+        )
 
-    @discord.ui.button(label="認証する", style=discord.ButtonStyle.success, custom_id="verify_button")
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if not guild:
-            await interaction.response.send_message("サーバー内でのみ利用できます。", ephemeral=True)
-            return
+        async def on_click(interaction: discord.Interaction):
+            guild = interaction.guild
+            if not guild:
+                await interaction.response.send_message("サーバー内でのみ利用できます。", ephemeral=True)
+                return
 
-        role = await ensure_verified_role(guild)
-        if role is None:
-            await interaction.response.send_message("❌ Botにロール作成/付与権限がありません。", ephemeral=True)
-            return
+            role = guild.get_role(self.role_id)
+            if role is None:
+                await interaction.response.send_message("❌ 紐づくロールが見つかりませんでした。サーバー管理者に連絡してください。", ephemeral=True)
+                return
 
-        member = interaction.user
-        if role in member.roles:
-            await interaction.response.send_message("すでに認証済みです。", ephemeral=True)
-            return
+            member = interaction.user
+            if role in member.roles:
+                await interaction.response.send_message("すでに認証済みです。", ephemeral=True)
+                return
 
-        try:
-            await member.add_roles(role, reason="Verification button")
-            await interaction.response.send_message("✅ 認証しました！", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ ロールを付与できません。Botの権限とロール順位を確認してください。", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ エラー: {e}", ephemeral=True)
+            try:
+                await member.add_roles(role, reason="Verification button")
+                await interaction.response.send_message("✅ 認証しました！", ephemeral=True)
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ ロールを付与できません。Botの権限とロール順位を確認してください。", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"❌ エラー: {e}", ephemeral=True)
+
+        button.callback = on_click
+        self.add_item(button)
 
 def get_ai_client(model_type):
     global key_indexes
@@ -114,8 +147,9 @@ async def on_ready():
     print(f'✅ ログイン: {bot.user.name}')
     print(f'🆔 Bot ID: {bot.user.id}')
     print(f'📡 接続サーバー数: {len(bot.guilds)}')
-    # 永続ビューを登録（再起動後も認証ボタンを動かす）
-    bot.add_view(VerificationView())
+    # 永続ビューを再登録（再起動後も認証ボタンを動かす）
+    for role_id in load_verify_role_ids():
+        bot.add_view(VerificationView(role_id))
     
     # スラッシュコマンドを同期 (重複解消バージョン)
     try:
@@ -511,8 +545,8 @@ async def calc_slash(interaction: discord.Interaction, expression: str):
 # ===== 実用ツール (スラッシュ対応) =====
 
 @bot.tree.command(name='setup_verify', description='認証ボタンを設置（サーバー所有者のみ）')
-@app_commands.describe(channel='設置先チャンネル（未指定なら現在のチャンネル）', description_text='案内文（省略可）')
-async def setup_verify_slash(interaction: discord.Interaction, channel: discord.TextChannel = None, description_text: str = "ルールを読んだら下のボタンを押してください。"):
+@app_commands.describe(channel='設置先チャンネル（未指定なら現在のチャンネル）', role='付与したいロール（未指定なら新規作成の Verified）', description_text='案内文（省略可）')
+async def setup_verify_slash(interaction: discord.Interaction, channel: discord.TextChannel = None, role: discord.Role = None, description_text: str = "ルールを読んだら下のボタンを押してください。"):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
@@ -530,9 +564,18 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
         await interaction.response.send_message("Botに`ロールの管理`権限がありません。付与してください。", ephemeral=True)
         return
 
-    role = await ensure_verified_role(guild)
-    if role is None:
-        await interaction.response.send_message("ロールを作成/参照できません。Botの権限とロール位置を確認してください。", ephemeral=True)
+    target_role = role
+    if target_role is None:
+        target_role = await ensure_verified_role(guild)
+        if target_role is None:
+            await interaction.response.send_message("ロールを作成/参照できません。Botの権限とロール位置を確認してください。", ephemeral=True)
+            return
+
+    if target_role.managed:
+        await interaction.response.send_message("このロールはシステム管理ロールのため付与できません。別のロールを選んでください。", ephemeral=True)
+        return
+    if target_role.position >= me.top_role.position:
+        await interaction.response.send_message("Botのロールより上位のため付与できません。ロール順を調整してください。", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -540,10 +583,12 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
         description=description_text,
         color=0x57F287
     )
-    embed.set_footer(text=f"ボタンを押すと「{role.name}」ロールが付与されます。")
-    view = VerificationView()
+    embed.set_footer(text=f"ボタンを押すと「{target_role.name}」ロールが付与されます。")
+    view = VerificationView(target_role.id)
+    bot.add_view(view)  # 永続ビューとして登録
+    persist_verify_role_id(target_role.id)
     await target_channel.send(embed=embed, view=view)
-    await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました。付与ロール: `{role.name}`", ephemeral=True)
+    await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました。付与ロール: `{target_role.name}`", ephemeral=True)
 
 
 @bot.tree.command(name='remind', description='リマインダーを設定します')
