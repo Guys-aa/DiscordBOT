@@ -12,36 +12,25 @@ import io
 import base64
 import socket
 import ssl
-import re
+import uuid
 import qrcode
 import matplotlib.pyplot as plt
 import yfinance as yf
 import dns.resolver
 from gtts import gTTS
 from textblob import TextBlob
-from openai import OpenAI
 import numpy as np # Added for graph command
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===== Bot & API 設定 =====
+# ===== Bot & 設定 =====
 
-# GitHub Models API 設定
-# GPT-4o mini 用のトークン (複数ある場合はカンマ区切りで .env に記述)
-GPT4O_MINI_KEYS = os.getenv("GPT4O_MINI_KEYS", "").split(",")
-# DeepSeek 用のトークン
-DEEPSEEK_KEYS = os.getenv("DEEPSEEK_KEYS", "").split(",")
-
-# キーのローテーション用インデックス
-key_indexes = {"gpt-4o-mini": 0, "deepseek": 0}
-
-# 会話履歴を保持する辞書 {user_id: [messages]}
-user_histories = {}
-MAX_HISTORY = 10 # 保存する直近のメッセージ数
 VERIFIED_ROLE_NAME = "Verified"  # 役割未指定時に自動作成するロール名
 VERIFY_CONFIG_FILE = "verify_buttons.json"  # ボタンが紐づくロールIDの保存先
 PRODUCT_CONFIG_FILE = "product_buttons.json"  # 商品ボタンの状態保存
+PAYPAY_CHANNEL_FILE = "paypay_notify_channel.json"  # PayPayギフト確認用チャンネル（ギルドごと）
+PENDING_ORDERS_FILE = "pending_orders.json"  # 購入申請の状態
 
 
 def load_verify_role_ids():
@@ -87,6 +76,79 @@ def persist_product_config(product_id: str, data: dict):
             json.dump(current, f)
     except Exception as e:
         print(f"⚠️ 商品ボタン設定の保存に失敗しました: {e}")
+
+
+def load_paypay_notify_channels() -> dict[int, int]:
+    try:
+        with open(PAYPAY_CHANNEL_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            return {int(k): int(v) for k, v in raw.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ PayPay通知チャンネル設定の読み込みに失敗しました: {e}")
+        return {}
+
+
+def persist_paypay_notify_channel(guild_id: int, channel_id: int):
+    data = load_paypay_notify_channels()
+    data[int(guild_id)] = int(channel_id)
+    try:
+        with open(PAYPAY_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in data.items()}, f)
+    except Exception as e:
+        print(f"⚠️ PayPay通知チャンネル設定の保存に失敗しました: {e}")
+
+
+def get_paypay_notify_channel_id(guild_id: int) -> int | None:
+    return load_paypay_notify_channels().get(int(guild_id))
+
+
+def load_pending_orders() -> dict:
+    try:
+        with open(PENDING_ORDERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ 購入申請データの読み込みに失敗しました: {e}")
+        return {}
+
+
+def persist_pending_orders(orders: dict):
+    try:
+        with open(PENDING_ORDERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(orders, f)
+    except Exception as e:
+        print(f"⚠️ 購入申請データの保存に失敗しました: {e}")
+
+
+def get_order(order_id: str) -> dict | None:
+    return load_pending_orders().get(order_id)
+
+
+def upsert_order(order_id: str, data: dict):
+    orders = load_pending_orders()
+    orders[order_id] = data
+    persist_pending_orders(orders)
+
+
+def update_order_status(order_id: str, status: str):
+    orders = load_pending_orders()
+    if order_id not in orders:
+        return
+    orders[order_id]["status"] = status
+    persist_pending_orders(orders)
+
+
+def is_guild_manager(interaction: discord.Interaction) -> bool:
+    guild = interaction.guild
+    if not guild:
+        return False
+    member = guild.get_member(interaction.user.id)
+    if not member:
+        return False
+    return member.guild_permissions.administrator or member.guild_permissions.manage_guild
 
 
 async def ensure_verified_role(guild: discord.Guild):
@@ -141,23 +203,232 @@ class VerificationView(discord.ui.View):
         self.add_item(button)
 
 
+class PayPayGiftModal(discord.ui.Modal):
+    """購入者が PayPay ギフトリンクを入力するモーダル。"""
+
+    def __init__(self, product_title: str, selected_option: str):
+        super().__init__(title="PayPayギフトリンク")
+        self.product_title = product_title
+        self.selected_option = selected_option
+        self.link_input = discord.ui.TextInput(
+            label="PayPayギフトのURL",
+            placeholder="https://pay.paypay.ne.jp/ ...",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.link_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("サーバー内でのみ利用できます。", ephemeral=True)
+            return
+
+        notify_ch_id = get_paypay_notify_channel_id(guild.id)
+        if not notify_ch_id:
+            await interaction.response.send_message(
+                "管理者がまだ PayPay 確認用チャンネルを設定していません。サーバー所有者に `/set_paypay_channel` の設定を依頼してください。",
+                ephemeral=True,
+            )
+            return
+
+        channel = guild.get_channel(notify_ch_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("通知チャンネルが無効です。管理者に連絡してください。", ephemeral=True)
+            return
+
+        me = guild.me
+        if me and not channel.permissions_for(me).send_messages:
+            await interaction.response.send_message("Bot が通知チャンネルに投稿できません。権限を確認してください。", ephemeral=True)
+            return
+
+        gift_link = self.link_input.value.strip()
+        buyer = interaction.user
+        order_id = uuid.uuid4().hex
+
+        embed = discord.Embed(
+            title="購入申請（PayPayギフト）",
+            color=0xFEE75C,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="ユーザー", value=f"{buyer.mention} (`{buyer.id}`)", inline=False)
+        embed.add_field(name="商品", value=self.product_title[:1024], inline=True)
+        embed.add_field(name="選択", value=self.selected_option[:1024], inline=True)
+        embed.add_field(name="PayPayギフトリンク", value=f"```{gift_link}```", inline=False)
+
+        view = AdminOrderView(order_id)
+        interaction.client.add_view(view)
+
+        await interaction.response.defer(ephemeral=True)
+
+        msg = await channel.send(embed=embed, view=view)
+        upsert_order(
+            order_id,
+            {
+                "guild_id": guild.id,
+                "channel_id": channel.id,
+                "message_id": msg.id,
+                "buyer_id": buyer.id,
+                "buyer_name": str(buyer),
+                "product_title": self.product_title,
+                "selected_option": self.selected_option,
+                "gift_link": gift_link,
+                "status": "pending",
+            },
+        )
+
+        await interaction.followup.send(
+            "PayPayギフトリンクを管理者に送信しました。内容確認後、DMでダウンロード案内が届きます。",
+            ephemeral=True,
+        )
+
+
+class DownloadLinkModal(discord.ui.Modal):
+    """管理者が商品のダウンロードURLを入力して購入者にDM送付。"""
+
+    def __init__(self, order_id: str):
+        super().__init__(title="ダウンロードリンクを送付")
+        self.order_id = order_id
+        self.url_input = discord.ui.TextInput(
+            label="ダウンロードURL",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.url_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_guild_manager(interaction):
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+
+        order = get_order(self.order_id)
+        if not order or order.get("status") != "pending":
+            await interaction.response.send_message("この申請は既に処理済みです。", ephemeral=True)
+            return
+
+        url = self.url_input.value.strip()
+        buyer_id = int(order["buyer_id"])
+        user = interaction.client.get_user(buyer_id)
+        if user is None:
+            try:
+                user = await interaction.client.fetch_user(buyer_id)
+            except discord.NotFound:
+                await interaction.response.send_message("購入者ユーザーが見つかりません。", ephemeral=True)
+                return
+
+        product_title = order.get("product_title", "商品")
+        selected = order.get("selected_option", "")
+        try:
+            await user.send(f"**{product_title}**（{selected}）のダウンロードリンクです:\n{url}")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "DM を送信できませんでした（受信設定をオフにしている可能性があります）。別途ユーザーに連絡してください。",
+                ephemeral=True,
+            )
+            return
+
+        ch = interaction.client.get_channel(int(order["channel_id"]))
+        if ch:
+            try:
+                msg = await ch.fetch_message(int(order["message_id"]))
+                if msg.embeds:
+                    old = msg.embeds[0]
+                    emb = discord.Embed(title=old.title, description=old.description, color=discord.Color.green())
+                    for field in old.fields:
+                        emb.add_field(name=field.name, value=field.value, inline=field.inline)
+                    emb.set_footer(text="ステータス: DLリンクを送付済み")
+                    if old.timestamp:
+                        emb.timestamp = old.timestamp
+                    await msg.edit(embed=emb, view=None)
+            except Exception as e:
+                print(f"⚠️ 管理者メッセージ更新エラー: {e}")
+
+        update_order_status(self.order_id, "fulfilled")
+        await interaction.response.send_message("購入者にダウンロードリンクを送信しました。", ephemeral=True)
+
+
+class AdminOrderView(discord.ui.View):
+    """通知チャンネル上で管理者が送付/却下を選ぶビュー。"""
+
+    def __init__(self, order_id: str):
+        super().__init__(timeout=None)
+        self.order_id = order_id
+
+        fulfill_btn = discord.ui.Button(
+            label="DLリンクを送付",
+            style=discord.ButtonStyle.success,
+            custom_id=f"order_fulfill:{order_id}",
+        )
+        decline_btn = discord.ui.Button(
+            label="送付しない（却下）",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"order_decline:{order_id}",
+        )
+        fulfill_btn.callback = self._on_fulfill
+        decline_btn.callback = self._on_decline
+        self.add_item(fulfill_btn)
+        self.add_item(decline_btn)
+
+    async def _on_fulfill(self, interaction: discord.Interaction):
+        if not is_guild_manager(interaction):
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+        order = get_order(self.order_id)
+        if not order or order.get("status") != "pending":
+            await interaction.response.send_message("この申請は既に処理済みです。", ephemeral=True)
+            return
+        await interaction.response.send_modal(DownloadLinkModal(self.order_id))
+
+    async def _on_decline(self, interaction: discord.Interaction):
+        if not is_guild_manager(interaction):
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+        order = get_order(self.order_id)
+        if not order or order.get("status") != "pending":
+            await interaction.response.send_message("この申請は既に処理済みです。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ch = interaction.client.get_channel(int(order["channel_id"]))
+        if ch:
+            try:
+                msg = await ch.fetch_message(int(order["message_id"]))
+                if msg.embeds:
+                    old = msg.embeds[0]
+                    emb = discord.Embed(title=old.title, description=old.description, color=discord.Color.red())
+                    for field in old.fields:
+                        emb.add_field(name=field.name, value=field.value, inline=field.inline)
+                    emb.set_footer(text="ステータス: 却下")
+                    if old.timestamp:
+                        emb.timestamp = old.timestamp
+                    await msg.edit(embed=emb, view=None)
+            except Exception as e:
+                print(f"⚠️ 管理者メッセージ更新エラー: {e}")
+
+        update_order_status(self.order_id, "declined")
+        await interaction.followup.send("却下しました。", ephemeral=True)
+
+
 class ProductView(discord.ui.View):
-    def __init__(self, product_id: str, stock_text: str, buy_url: str | None, options: list[str]):
+    def __init__(self, product_id: str, stock_text: str, product_title: str, options: list[str]):
         super().__init__(timeout=None)
         self.product_id = product_id
         self.stock_text = stock_text
-        self.buy_url = buy_url
+        self.product_title = product_title or "商品"
         self.options = options or []
 
         buy_button = discord.ui.Button(
             label="購入する",
             style=discord.ButtonStyle.primary,
-            custom_id=f"product_buy:{product_id}"
+            custom_id=f"product_buy:{product_id}",
         )
         stock_button = discord.ui.Button(
             label="在庫確認",
             style=discord.ButtonStyle.success,
-            custom_id=f"product_stock:{product_id}"
+            custom_id=f"product_stock:{product_id}",
         )
 
         async def on_buy(interaction: discord.Interaction):
@@ -167,17 +438,13 @@ class ProductView(discord.ui.View):
 
             select = discord.ui.Select(
                 placeholder="購入する商品を選択してください",
-                options=[discord.SelectOption(label=opt[:100], value=opt[:100]) for opt in self.options][:25]
+                options=[discord.SelectOption(label=opt[:100], value=opt[:100]) for opt in self.options][:25],
             )
 
             async def on_select(select_interaction: discord.Interaction):
-                content = f"選択: **{select.values[0]}**"
-                if self.buy_url:
-                    view = discord.ui.View()
-                    view.add_item(discord.ui.Button(label="購入ページを開く", style=discord.ButtonStyle.link, url=self.buy_url))
-                    await select_interaction.response.send_message(content, view=view, ephemeral=True)
-                else:
-                    await select_interaction.response.send_message(f"{content}\n購入リンクは設定されていません。管理者にお問い合わせください。", ephemeral=True)
+                chosen = select.values[0]
+                modal = PayPayGiftModal(self.product_title, chosen)
+                await select_interaction.response.send_modal(modal)
 
             select.callback = on_select
             view = discord.ui.View()
@@ -192,19 +459,6 @@ class ProductView(discord.ui.View):
         self.add_item(buy_button)
         self.add_item(stock_button)
 
-def get_ai_client(model_type):
-    global key_indexes
-    keys = GPT4O_MINI_KEYS if model_type == "gpt-4o-mini" else DEEPSEEK_KEYS
-    # キーが空の場合のガード
-    if not keys or (len(keys) == 1 and keys[0] == ""):
-        raise ValueError(f"APIキーが設定されていません: {model_type}")
-        
-    idx = key_indexes[model_type] % len(keys)
-    key_indexes[model_type] += 1
-    return OpenAI(
-        base_url="https://models.inference.ai.azure.com",
-        api_key=keys[idx]
-    )
 
 # Botの設定
 intents = discord.Intents.default()
@@ -225,7 +479,17 @@ async def on_ready():
     for role_id in load_verify_role_ids():
         bot.add_view(VerificationView(role_id))
     for pid, pdata in load_product_configs().items():
-        bot.add_view(ProductView(pid, pdata.get("stock_text", "在庫未設定"), pdata.get("buy_url"), pdata.get("options", [])))
+        bot.add_view(
+            ProductView(
+                pid,
+                pdata.get("stock_text", "在庫未設定"),
+                pdata.get("title", "商品"),
+                pdata.get("options", []),
+            )
+        )
+    for oid, odata in load_pending_orders().items():
+        if odata.get("status") == "pending":
+            bot.add_view(AdminOrderView(oid))
     
     # スラッシュコマンドを同期 (重複解消バージョン)
     try:
@@ -268,14 +532,14 @@ async def on_command_error(ctx, error):
 async def send_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🌌 PRIM BOT ULTIMATE MENU",
-        description="GitHub Models (GPT-4o/DeepSeek) 搭載の最新鋭ボットです。",
+        description="ユーティリティと商品販売（PayPayギフト）向けのボットです。",
         color=0x2b2d31
     )
-    embed.add_field(name="🤖 AI & NLP", value="`/chat`, `/chat_clear`, `/translate`, `/sentiment`, `/tts` ", inline=False)
+    embed.add_field(name="📝 NLP", value="`/translate`, `/sentiment`, `/tts` ", inline=False)
     embed.add_field(name="💻 Developers", value="`/code`, `/github`, `/mermaid`, `/json`, `/hash`, `/password_gen` ", inline=False)
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
-    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/post_product`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
+    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
     embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
@@ -291,76 +555,7 @@ async def help_ctx(ctx): await send_help(ctx)
 async def help_slash(interaction: discord.Interaction): await send_help(interaction)
 
 
-# ===== 🤖 AI & 自然言語処理 (NLP) =====
-
-@bot.tree.command(name='chat', description='AI (GitHub Models) と会話します')
-@app_commands.describe(model='使用するモデル', message='相談内容')
-@app_commands.choices(model=[
-    app_commands.Choice(name='GPT-4o mini (高速/万能)', value='gpt-4o-mini'),
-    app_commands.Choice(name='DeepSeek (推論特化/思考表示あり)', value='deepseek'),
-])
-async def chat_slash(interaction: discord.Interaction, message: str, model: str = "gpt-4o-mini"):
-    # 応答を保留にする（3秒ルール対策）
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer()
-    except Exception:
-        pass # すでにレスポンスが開始されている場合はスキップ
-    
-    user_id = str(interaction.user.id)
-    if user_id not in user_histories:
-        user_histories[user_id] = []
-    
-    # 履歴に現在のメッセージを追加
-    user_histories[user_id].append({"role": "user", "content": message})
-    
-    # GitHub Models 上の実際のモデル名 ID を設定
-    model_id = "gpt-4o-mini" if model == "gpt-4o-mini" else "DeepSeek-R1"
-    
-    try:
-        client = get_ai_client(model)
-
-        # 履歴を含めて送信
-        response = client.chat.completions.create(
-            messages=user_histories[user_id],
-            model=model_id,
-        )
-        
-        ai_message = response.choices[0].message.content
-        
-        # --- 推論モデルの <think> タグ（思考プロセス）の処理 ---
-        raw_output = ai_message
-        clean_text = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL).strip()
-        
-        # 履歴には生の出力を保存
-        user_histories[user_id].append({"role": "assistant", "content": raw_output})
-        
-        # 履歴が長くなりすぎないように制限
-        if len(user_histories[user_id]) > MAX_HISTORY * 2:
-            user_histories[user_id] = user_histories[user_id][-(MAX_HISTORY * 2):]
-
-        # 表示用のテキストを選択
-        final_text = clean_text if clean_text else "回答を生成しましたが、内容が空です（思考のみが行われた可能性があります）。"
-
-        if len(final_text) > 2000:
-            file = io.BytesIO(final_text.encode('utf-8'))
-            await interaction.followup.send(f"📄 **AI回答 ({model})** が長いためファイル出力しました：", file=discord.File(file, "response.txt"))
-        else:
-            await interaction.followup.send(f"🤖 **AI回答 ({model})**:\n{final_text}")
-    except Exception as e:
-        # エラーが発生した場合は履歴から最後の入力を削除
-        if user_id in user_histories and user_histories[user_id]:
-            user_histories[user_id].pop()
-        await interaction.followup.send(f"❌ AIエラー: {e}")
-
-@bot.tree.command(name='chat_clear', description='あなたとの会話の履歴をリセットします')
-async def chat_clear_slash(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    if user_id in user_histories:
-        user_histories[user_id] = []
-        await interaction.response.send_message("🧹 会話の履歴をリセットしました！", ephemeral=True)
-    else:
-        await interaction.response.send_message("履歴はすでに空です。", ephemeral=True)
+# ===== 自然言語処理 (NLP) =====
 
 @bot.tree.command(name='translate', description='テキストを翻訳します（英語など）')
 async def translate_slash(interaction: discord.Interaction, text: str, to_lang: str = "ja"):
@@ -668,16 +863,38 @@ async def setup_verify_slash(interaction: discord.Interaction, channel: discord.
     await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました。付与ロール: `{target_role.name}`", ephemeral=True)
 
 
+@bot.tree.command(name='set_paypay_channel', description='PayPayギフト確認用チャンネルを設定します（購入者のリンクが届く先・サーバー所有者のみ）')
+@app_commands.describe(channel='管理者がギフトリンクを確認するテキストチャンネル')
+async def set_paypay_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
+        return
+    if interaction.user.id != guild.owner_id:
+        await interaction.response.send_message("このコマンドはサーバー所有者のみ実行できます。", ephemeral=True)
+        return
+
+    me = guild.me
+    if not channel.permissions_for(me).send_messages or not channel.permissions_for(me).embed_links:
+        await interaction.response.send_message("そのチャンネルに Bot がメッセージ・埋め込みを送信できません。権限を確認してください。", ephemeral=True)
+        return
+
+    persist_paypay_notify_channel(guild.id, channel.id)
+    await interaction.response.send_message(
+        f"PayPay ギフト確認チャンネルを {channel.mention} に設定しました。`/post_product` の「購入する」から届くリンクはここに表示されます。",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name='post_product', description='商品カードを投稿します（所有者のみ）')
 @app_commands.describe(
     title='商品名/見出し',
     body='説明文',
     price='価格テキスト (例: 1200円)',
     stock_text='在庫情報 (例: 在庫あり/残り3など)',
-    buy_url='購入リンク (省略可)',
     options='購入時に選択させる商品リスト（改行区切り）',
     image_url='画像URL (省略可)',
-    channel='投稿先チャンネル (省略可)'
+    channel='投稿先チャンネル (省略可)',
 )
 async def post_product_slash(
     interaction: discord.Interaction,
@@ -685,10 +902,9 @@ async def post_product_slash(
     body: str,
     price: str,
     stock_text: str,
-    buy_url: str = None,
     options: str = None,
     image_url: str = None,
-    channel: discord.TextChannel = None
+    channel: discord.TextChannel = None,
 ):
     guild = interaction.guild
     if not guild:
@@ -715,9 +931,9 @@ async def post_product_slash(
         embed.set_image(url=image_url)
     embed.set_footer(text="Developer @pri_m123")
 
-    view = ProductView(product_id, stock_text, buy_url, option_list)
+    view = ProductView(product_id, stock_text, title, option_list)
     bot.add_view(view)
-    persist_product_config(product_id, {"stock_text": stock_text, "buy_url": buy_url, "options": option_list})
+    persist_product_config(product_id, {"stock_text": stock_text, "title": title, "options": option_list})
     await target_channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"{target_channel.mention} に商品カードを投稿しました。", ephemeral=True)
 
