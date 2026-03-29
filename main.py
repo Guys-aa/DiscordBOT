@@ -206,10 +206,12 @@ class VerificationView(discord.ui.View):
 class PayPayGiftModal(discord.ui.Modal):
     """購入者が PayPay ギフトリンクを入力するモーダル。"""
 
-    def __init__(self, product_title: str, selected_option: str):
+    def __init__(self, product_id: str, product_title: str, selected_option: str, buy_url: str | None):
         super().__init__(title="PayPayギフトリンク")
+        self.product_id = product_id
         self.product_title = product_title
         self.selected_option = selected_option
+        self.buy_url = (buy_url.strip() if buy_url else None) or None
         self.link_input = discord.ui.TextInput(
             label="PayPayギフトのURL",
             placeholder="https://pay.paypay.ne.jp/ ...",
@@ -256,6 +258,12 @@ class PayPayGiftModal(discord.ui.Modal):
         embed.add_field(name="商品", value=self.product_title[:1024], inline=True)
         embed.add_field(name="選択", value=self.selected_option[:1024], inline=True)
         embed.add_field(name="PayPayギフトリンク", value=f"```{gift_link}```", inline=False)
+        if self.buy_url:
+            embed.add_field(
+                name="商品に登録されたダウンロードURL",
+                value=f"```{self.buy_url[:900]}```",
+                inline=False,
+            )
 
         view = AdminOrderView(order_id)
         interaction.client.add_view(view)
@@ -271,9 +279,11 @@ class PayPayGiftModal(discord.ui.Modal):
                 "message_id": msg.id,
                 "buyer_id": buyer.id,
                 "buyer_name": str(buyer),
+                "product_id": self.product_id,
                 "product_title": self.product_title,
                 "selected_option": self.selected_option,
                 "gift_link": gift_link,
+                "buy_url": self.buy_url,
                 "status": "pending",
             },
         )
@@ -290,11 +300,16 @@ class DownloadLinkModal(discord.ui.Modal):
     def __init__(self, order_id: str):
         super().__init__(title="ダウンロードリンクを送付")
         self.order_id = order_id
+        order = get_order(order_id) or {}
+        default_url = (order.get("buy_url") or "").strip() or None
+        if default_url and len(default_url) > 400:
+            default_url = default_url[:400]
         self.url_input = discord.ui.TextInput(
             label="ダウンロードURL",
             style=discord.TextStyle.short,
             required=True,
             max_length=500,
+            default=default_url if default_url else None,
         )
         self.add_item(self.url_input)
 
@@ -413,11 +428,12 @@ class AdminOrderView(discord.ui.View):
 
 
 class ProductView(discord.ui.View):
-    def __init__(self, product_id: str, stock_text: str, product_title: str, options: list[str]):
+    def __init__(self, product_id: str, stock_text: str, product_title: str, options: list[str], buy_url: str | None = None):
         super().__init__(timeout=None)
         self.product_id = product_id
         self.stock_text = stock_text
         self.product_title = product_title or "商品"
+        self.buy_url = (buy_url.strip() if buy_url else None) or None
         self.options = options or []
 
         buy_button = discord.ui.Button(
@@ -443,7 +459,7 @@ class ProductView(discord.ui.View):
 
             async def on_select(select_interaction: discord.Interaction):
                 chosen = select.values[0]
-                modal = PayPayGiftModal(self.product_title, chosen)
+                modal = PayPayGiftModal(self.product_id, self.product_title, chosen, self.buy_url)
                 await select_interaction.response.send_modal(modal)
 
             select.callback = on_select
@@ -485,6 +501,7 @@ async def on_ready():
                 pdata.get("stock_text", "在庫未設定"),
                 pdata.get("title", "商品"),
                 pdata.get("options", []),
+                pdata.get("buy_url"),
             )
         )
     for oid, odata in load_pending_orders().items():
@@ -892,6 +909,7 @@ async def set_paypay_channel_slash(interaction: discord.Interaction, channel: di
     body='説明文',
     price='価格テキスト (例: 1200円)',
     stock_text='在庫情報 (例: 在庫あり/残り3など)',
+    buy_url='商品のダウンロードURL（省略可・管理者通知とDL送付モーダルの初期値に使います）',
     options='購入時に選択させる商品リスト（改行区切り）',
     image_url='画像URL (省略可)',
     channel='投稿先チャンネル (省略可)',
@@ -902,6 +920,7 @@ async def post_product_slash(
     body: str,
     price: str,
     stock_text: str,
+    buy_url: str = None,
     options: str = None,
     image_url: str = None,
     channel: discord.TextChannel = None,
@@ -927,13 +946,19 @@ async def post_product_slash(
 
     embed = discord.Embed(title=title, description=body, color=0x2b2d31)
     embed.add_field(name="料金", value=f"```\n{price}\n```", inline=False)
+    if buy_url and buy_url.strip():
+        u = buy_url.strip()
+        embed.add_field(name="ダウンロード", value=f"[リンクを開く]({u})", inline=False)
     if image_url:
         embed.set_image(url=image_url)
     embed.set_footer(text="Developer @pri_m123")
 
-    view = ProductView(product_id, stock_text, title, option_list)
+    view = ProductView(product_id, stock_text, title, option_list, buy_url.strip() if buy_url else None)
     bot.add_view(view)
-    persist_product_config(product_id, {"stock_text": stock_text, "title": title, "options": option_list})
+    persist_product_config(
+        product_id,
+        {"stock_text": stock_text, "title": title, "options": option_list, "buy_url": buy_url.strip() if buy_url else None},
+    )
     await target_channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"{target_channel.mention} に商品カードを投稿しました。", ephemeral=True)
 
