@@ -946,9 +946,7 @@ async def post_product_slash(
 
     embed = discord.Embed(title=title, description=body, color=0x2b2d31)
     embed.add_field(name="料金", value=f"```\n{price}\n```", inline=False)
-    if buy_url and buy_url.strip():
-        u = buy_url.strip()
-        embed.add_field(name="ダウンロード", value=f"[リンクを開く]({u})", inline=False)
+    # Remove download URL from public display - will be sent via DM after purchase
     if image_url:
         embed.set_image(url=image_url)
     embed.set_footer(text="Developer @pri_m123")
