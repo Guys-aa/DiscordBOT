@@ -556,7 +556,7 @@ async def send_help(interaction: discord.Interaction):
     embed.add_field(name="💻 Developers", value="`/code`, `/github`, `/mermaid`, `/json`, `/hash`, `/password_gen` ", inline=False)
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
-    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/remind`, `/poll`, `/clear`, `/say` ", inline=False)
+    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/clear`, `/clear_all`, `/remind`, `/poll`, `/say` ", inline=False)
     embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
@@ -986,6 +986,65 @@ async def clear_slash(interaction: discord.Interaction, amount: int = 5):
     await interaction.response.defer(ephemeral=True)
     await interaction.channel.purge(limit=amount)
     await interaction.followup.send(f'🧹 {amount}件削除しました。', ephemeral=True)
+
+@bot.tree.command(name='clear_all', description='チャンネルの全メッセージを削除します（TOP ADMINロールのみ）')
+@app_commands.describe(channel='削除対象チャンネル（省略時は現在のチャンネル）')
+async def clear_all_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
+        return
+    
+    # TOP ADMINロールの確認
+    member = guild.get_member(interaction.user.id)
+    if not member:
+        await interaction.response.send_message("ユーザー情報が見つかりません。", ephemeral=True)
+        return
+    
+    top_admin_role = None
+    for role in member.roles:
+        if role.name.upper() == "TOP ADMIN":
+            top_admin_role = role
+            break
+    
+    if not top_admin_role:
+        await interaction.response.send_message("このコマンドはTOP ADMINロールのみ実行できます。", ephemeral=True)
+        return
+    
+    target_channel = channel or interaction.channel
+    me = guild.me
+    
+    # 権限確認
+    if not target_channel.permissions_for(me).manage_messages:
+        await interaction.response.send_message(f"{target_channel.mention} でメッセージを管理する権限がありません。", ephemeral=True)
+        return
+    
+    if not target_channel.permissions_for(me).read_message_history:
+        await interaction.response.send_message(f"{target_channel.mention} のメッセージ履歴を読む権限がありません。", ephemeral=True)
+        return
+    
+    await interaction.response.send_message(f"{target_channel.mention} のメッセージを全削除中です...", ephemeral=True)
+    
+    try:
+        deleted_count = 0
+        async for message in target_channel.history(limit=None):
+            try:
+                await message.delete()
+                deleted_count += 1
+                # API制限を避けるために少し待機
+                if deleted_count % 10 == 0:
+                    await asyncio.sleep(1)
+            except discord.Forbidden:
+                continue  # 削除できないメッセージはスキップ
+            except Exception as e:
+                print(f"⚠️ メッセージ削除エラー: {e}")
+                continue
+        
+        await interaction.followup.send(f"✅ {target_channel.mention} で {deleted_count}件のメッセージを削除しました。", ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ 削除中にエラーが発生しました: {e}", ephemeral=True)
+
 
 @bot.tree.command(name='say', description='ボットにメッセージを言わせます')
 async def say_slash(interaction: discord.Interaction, text: str):
