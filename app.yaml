@@ -11,6 +11,8 @@ services:
   envs:
   - key: DISCORD_TOKEN
     value: ${DISCORD_TOKEN}
+ - key: DISCORD_TOKEN2
+    value: ${DISCORD_TOKEN2}
   - key: GITHUB_GPT4O_KEYS
     value: ${GITHUB_GPT4O_KEYS}
   - key: GITHUB_DEEPSEEK_KEYS
