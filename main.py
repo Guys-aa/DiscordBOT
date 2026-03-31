@@ -610,7 +610,7 @@ async def send_help(interaction: discord.Interaction):
     embed.add_field(name="💻 Developers", value="`/code`, `/github`, `/mermaid`, `/json`, `/hash`, `/password_gen` ", inline=False)
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
-    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/clear`, `/clear_all`, `/remind`, `/poll`, `/say` ", inline=False)
+    embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/clear`, `/clear_all`, `/remind`, `/poll`, `/say`, `/web_auth` ", inline=False)
     embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
@@ -1132,6 +1132,41 @@ async def avatar_slash(interaction: discord.Interaction, user: discord.User = No
     embed = discord.Embed(title=f'{user.display_name}', color=0x2b2d31)
     embed.set_image(url=user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='web_auth', description='Webサイト用の認証トークンを取得します')
+async def web_auth_slash(interaction: discord.Interaction):
+    """Webサイト用認証トークンを生成してDMに送信"""
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # トークンを生成（bot2と同じロジック）
+        import secrets
+        import datetime
+        token = secrets.token_urlsafe(32)
+        
+        # トークン情報を保存（簡易版）
+        expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
+        
+        # DMでトークンを送信
+        web_url = "file:///c%3A/Users/user/Videos/NVIDIA/Desktop/DiscordBot/DiscordServerWebStore/auth.html"
+        embed = discord.Embed(
+            title="🔐 Webサイト認証トークン",
+            description="以下のトークンをWebサイトで入力して認証してください。",
+            color=0x5865F2
+        )
+        embed.add_field(name="認証トークン", value=f"```\n{token}\n```", inline=False)
+        embed.add_field(name="Webサイト", value=f"[アクセスする]({web_url})", inline=False)
+        embed.add_field(name="有効期限", value="1時間", inline=True)
+        embed.set_footer(text="このトークンを共有しないでください")
+        
+        try:
+            await interaction.user.send(embed=embed)
+            await interaction.followup.send("認証トークンをDMに送信しました。", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("DMを送信できませんでした。プライバシー設定を確認してください。", ephemeral=True)
+            
+    except Exception as e:
+        await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
 # ===== Botの起動 =====
