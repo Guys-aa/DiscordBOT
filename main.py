@@ -4,6 +4,7 @@ from discord import app_commands
 import random
 import asyncio
 import datetime
+import time
 import hashlib
 import json
 import aiohttp
@@ -13,6 +14,7 @@ import base64
 import socket
 import ssl
 import uuid
+import sys
 import qrcode
 import matplotlib.pyplot as plt
 import yfinance as yf
@@ -21,6 +23,18 @@ from gtts import gTTS
 from textblob import TextBlob
 import numpy as np # Added for graph command
 from dotenv import load_dotenv
+
+# Avoid UnicodeEncodeError in logs on non-UTF8 environments.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 load_dotenv()
 
@@ -32,6 +46,13 @@ PRODUCT_CONFIG_FILE = "product_buttons.json"  # 商品ボタンの状態保存
 PAYPAY_CHANNEL_FILE = "paypay_notify_channel.json"  # PayPayギフト確認用チャンネル（ギルドごと）
 PENDING_ORDERS_FILE = "pending_orders.json"  # 購入申請の状態
 WEB_AUTH_FILE = "web_auth_tokens.json"  # Web認証トークン管理
+AUTO_SYNC_ON_READY = os.getenv("AUTO_SYNC_ON_READY", "true").lower() in {"1", "true", "yes", "on"}
+CLEAR_GUILD_COMMANDS_ON_READY = os.getenv("CLEAR_GUILD_COMMANDS_ON_READY", "false").lower() in {"1", "true", "yes", "on"}
+SYNC_COOLDOWN_SECONDS = int(os.getenv("SYNC_COOLDOWN_SECONDS", "1800"))  # 30分
+STARTUP_RETRY_BASE_SECONDS = int(os.getenv("STARTUP_RETRY_BASE_SECONDS", "30"))
+STARTUP_RETRY_MAX_SECONDS = int(os.getenv("STARTUP_RETRY_MAX_SECONDS", "900"))  # 15分
+STARTUP_RETRY_LIMIT = int(os.getenv("STARTUP_RETRY_LIMIT", "0"))  # 0: 無制限
+WAITRESS_THREADS = int(os.getenv("WAITRESS_THREADS", "8"))
 
 
 def load_verify_role_ids():
@@ -435,10 +456,78 @@ class AdminOrderView(discord.ui.View):
             style=discord.ButtonStyle.danger,
             custom_id=f"order_decline:{order_id}",
         )
+        approve_role_btn = discord.ui.Button(
+            label="ロール付与 & 承認",
+            style=discord.ButtonStyle.success,
+            custom_id=f"order_role_approve:{order_id}",
+            emoji="👑"
+        )
         fulfill_btn.callback = self._on_fulfill
         decline_btn.callback = self._on_decline
+        approve_role_btn.callback = self._on_approve_role
         self.add_item(fulfill_btn)
+        self.add_item(approve_role_btn)
         self.add_item(decline_btn)
+
+    async def _on_approve_role(self, interaction: discord.Interaction):
+        if not is_guild_manager(interaction):
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+        
+        order = get_order(self.order_id)
+        if not order:
+            await interaction.response.send_message("注文データが見つかりません。", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        buyer_id = int(order["buyer_id"])
+        member = guild.get_member(buyer_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(buyer_id)
+            except discord.NotFound:
+                await interaction.response.send_message("購入者がサーバー内に見つかりません。", ephemeral=True)
+                return
+
+        # 商品詳細から Role ID を探す
+        product_detail = order.get("selected_option", "")
+        import re
+        role_match = re.search(r"Role: (\d+)", product_detail)
+        
+        if not role_match:
+            await interaction.response.send_message("この商品には自動付与ロールが設定されていません。手動で対応してください。", ephemeral=True)
+            return
+
+        role_id = int(role_match.group(1))
+        role = guild.get_role(role_id)
+        
+        if not role:
+            await interaction.response.send_message(f"❌ ロール (ID: {role_id}) が見つかりません。", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role, reason=f"Web Store Purchase: {order['product_title']}")
+            update_order_status(self.order_id, "fulfilled")
+            
+            # メッセージ更新
+            ch = interaction.client.get_channel(int(order["channel_id"]))
+            if ch:
+                msg = await ch.fetch_message(int(order["message_id"]))
+                emb = msg.embeds[0]
+                emb.color = discord.Color.gold()
+                emb.set_footer(text="ステータス: ロール付与済み (自動)")
+                await msg.edit(embed=emb, view=None)
+
+            await interaction.response.send_message(f"✅ {member.mention} に {role.name} を付与しました。", ephemeral=True)
+            try:
+                await member.send(f"🌟 ご購入ありがとうございます！**{role.name}** ロールを付与しました。")
+            except: pass
+            
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ ロール付与権限がありません。Botのロールを一番上に移動してください。", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
+
 
     async def _on_fulfill(self, interaction: discord.Interaction):
         if not is_guild_manager(interaction):
@@ -536,42 +625,88 @@ intents.message_content = True
 intents.members = True
 
 # プレフィックスコマンドとスラッシュコマンドの両方を使用
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "."), intents=intents, help_command=None)
+last_global_sync_at: datetime.datetime | None = None
+persistent_views_registered = False
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    text = str(error).lower()
+    if isinstance(error, discord.HTTPException) and error.status == 429:
+        return True
+    return "rate limited" in text or "error 1015" in text or "cloudflare" in text
+
+
+async def safe_sync_commands(guild: discord.Guild | None = None) -> list[app_commands.AppCommand]:
+    delays = [5, 15, 45, 90]
+    target = f"{guild.name} ({guild.id})" if guild else "グローバル"
+
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            return await bot.tree.sync(guild=guild)
+        except Exception as e:
+            is_last = attempt == len(delays)
+            if is_last or not _is_rate_limit_error(e):
+                raise
+            print(f"⚠️ {target}同期でレート制限を検出: {e}")
+            print(f"⏳ {delay}秒待機して再試行します ({attempt}/{len(delays)})")
+            await asyncio.sleep(delay)
+
+    return []
 
 
 @bot.event
 async def on_ready():
     """Botが起動したときに呼ばれるイベント"""
+    global last_global_sync_at, persistent_views_registered
+
     print(f'✅ ログイン: {bot.user.name}')
     print(f'🆔 Bot ID: {bot.user.id}')
     print(f'📡 接続サーバー数: {len(bot.guilds)}')
     # 永続ビューを再登録（再起動後も認証ボタンを動かす）
-    for role_id in load_verify_role_ids():
-        bot.add_view(VerificationView(role_id))
-    for pid, pdata in load_product_configs().items():
-        bot.add_view(
-            ProductView(
-                pid,
-                pdata.get("stock_text", "在庫未設定"),
-                pdata.get("title", "商品"),
-                pdata.get("options", []),
-                pdata.get("buy_url"),
+    if not persistent_views_registered:
+        for role_id in load_verify_role_ids():
+            bot.add_view(VerificationView(role_id))
+        for pid, pdata in load_product_configs().items():
+            bot.add_view(
+                ProductView(
+                    pid,
+                    pdata.get("stock_text", "在庫未設定"),
+                    pdata.get("title", "商品"),
+                    pdata.get("options", []),
+                    pdata.get("buy_url"),
+                )
             )
-        )
-    for oid, odata in load_pending_orders().items():
-        if odata.get("status") == "pending":
-            bot.add_view(AdminOrderView(oid))
-    
-    # スラッシュコマンドを同期 (重複解消バージョン)
+        for oid, odata in load_pending_orders().items():
+            if odata.get("status") == "pending":
+                bot.add_view(AdminOrderView(oid))
+        persistent_views_registered = True
+
+    if not AUTO_SYNC_ON_READY:
+        print("⏭️ AUTO_SYNC_ON_READY=false のため起動時同期をスキップしました")
+        print('------')
+        return
+
+    now = _utc_now()
+    if last_global_sync_at and (now - last_global_sync_at).total_seconds() < SYNC_COOLDOWN_SECONDS:
+        remaining = int(SYNC_COOLDOWN_SECONDS - (now - last_global_sync_at).total_seconds())
+        print(f"⏭️ 起動時同期をスキップしました (クールダウン残り: {remaining}秒)")
+        print('------')
+        return
+
+    # スラッシュコマンドを同期
     try:
-        # 1. すべてのギルド（サーバー）から固有のコマンド設定を消去
-        for guild in bot.guilds:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-        
-        # 2. グローバルコマンドとして一括同期
-        await bot.tree.sync()
-        print(f'🔄 コマンドをグローバル同期しました。重複は解消されます。')
+        if CLEAR_GUILD_COMMANDS_ON_READY:
+            for guild in bot.guilds:
+                bot.tree.clear_commands(guild=guild)
+                await safe_sync_commands(guild=guild)
+        synced = await safe_sync_commands()
+        last_global_sync_at = _utc_now()
+        print(f'🔄 コマンドをグローバル同期しました ({len(synced)}個)')
     except Exception as e:
         print(f'❌ コマンド同期エラー: {e}')
     print('------')
@@ -581,6 +716,13 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user:
         return
+
+    # Web Store Webhook からのメッセージを監視 (BOTがWebhookメッセージを拾うための工夫)
+    # ※ 本来Webhookメッセージは on_message に入らないことが多いですが、
+    # ユーザーがリンクを貼ったり、Bot自身が検知できる形式で連携します。
+    # 今回はウェブストアが Bot の /api/order を叩くのではなく Webhook を使う想定なので
+    # もしBotに直接注文を送りたい場合は Flask の API を拡張するのがベストです。
+    
     await bot.process_commands(message)
 
 
@@ -611,7 +753,6 @@ async def send_help(interaction: discord.Interaction):
     embed.add_field(name="🌐 Network", value="`/http`, `/dns`, `/scan`, `/ssl`, `/ipinfo` ", inline=False)
     embed.add_field(name="📊 Tools & Media", value="`/graph`, `/qr`, `/crypto`, `/stock`, `/calc` ", inline=False)
     embed.add_field(name="🛠️ Utility", value="`/setup_verify`, `/set_paypay_channel`, `/post_product`, `/clear`, `/clear_all`, `/remind`, `/poll`, `/say`, `/web_auth` ", inline=False)
-    embed.add_field(name="🎉 Fun", value="`/dice`, `/omikuji`, `/avatar`, `/ping` ", inline=False)
     embed.set_footer(text="すべてのコマンドはスラッシュコマンド '/' で利用可能です。")
     
     if isinstance(interaction, discord.Interaction):
@@ -624,6 +765,66 @@ async def help_ctx(ctx): await send_help(ctx)
 
 @bot.tree.command(name='help', description='すべての高度なコマンドを表示します')
 async def help_slash(interaction: discord.Interaction): await send_help(interaction)
+
+
+@bot.command(name='join')
+async def join_ctx(ctx):
+    """実行者がいるボイスチャンネルにBotを参加させる (.join / !join)"""
+    if not ctx.guild:
+        await ctx.send("❌ このコマンドはサーバー内でのみ使えます。")
+        return
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("❌ 先にあなたがボイスチャンネルへ参加してください。")
+        return
+
+    target_channel = ctx.author.voice.channel
+    voice_client = ctx.guild.voice_client
+
+    try:
+        if voice_client and voice_client.is_connected():
+            if voice_client.channel and voice_client.channel.id == target_channel.id:
+                await ctx.send(f"✅ すでに {target_channel.mention} に参加しています。")
+                return
+            await voice_client.move_to(target_channel)
+        else:
+            await target_channel.connect()
+        await ctx.send(f"🔊 {target_channel.mention} に参加しました。")
+    except Exception as e:
+        await ctx.send(f"❌ VC参加に失敗しました: {e}")
+
+
+@bot.command(name='menbaku', aliases=['めんばく'])
+async def menbaku_ctx(ctx):
+    """管理者専用: サーバーメンバーを分割でメンションする (.menbaku / !menbaku)"""
+    if not ctx.guild:
+        await ctx.send("❌ このコマンドはサーバー内でのみ使えます。")
+        return
+
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ このコマンドは管理者のみ使用できます。")
+        return
+
+    members = [m for m in ctx.guild.members if not m.bot]
+    if not members:
+        await ctx.send("ℹ️ メンション対象のメンバーがいません。")
+        return
+
+    chunk_size = 20
+    total_chunks = (len(members) + chunk_size - 1) // chunk_size
+    await ctx.send(f"📣 メンバー通知を開始します。対象: {len(members)}人")
+
+    for i in range(0, len(members), chunk_size):
+        chunk = members[i:i + chunk_size]
+        mentions = " ".join(m.mention for m in chunk)
+        await ctx.send(
+            mentions,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        if (i // chunk_size) + 1 < total_chunks:
+            await asyncio.sleep(1.2)
+
+    await ctx.send("✅ メンバー通知が完了しました。")
 
 
 # ===== 自然言語処理 (NLP) =====
@@ -1111,69 +1312,178 @@ async def say_slash(interaction: discord.Interaction, text: str):
     except Exception as e:
         await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
 
-# ===== その他のコマンド =====
+# ===== Web認証サーバー =====
 
-@bot.tree.command(name='ping', description='応答速度')
-async def ping_slash(interaction: discord.Interaction):
-    await interaction.response.send_message(f'🏓 Pong! {round(bot.latency * 1000)}ms')
+from flask import Flask, request, jsonify, redirect
+import threading
+import requests
+import secrets
 
-@bot.tree.command(name='omikuji', description='運勢')
-async def omikuji_slash(interaction: discord.Interaction):
-    results = ["大吉 🌟", "吉 ✨", "中吉 👍", "小吉 🙂", "末吉 😐", "凶 💀", "大凶 👻"]
-    await interaction.response.send_message(f'🧧 運勢... **【 {random.choice(results)} 】**')
+# Flaskアプリケーション
+app = Flask(__name__)
 
-@bot.tree.command(name='dice', description='サイコロ')
-async def dice_slash(interaction: discord.Interaction, sides: int = 6):
-    await interaction.response.send_message(f'🎲 結果: **{random.randint(1, sides)}** ({sides}面)')
 
-@bot.tree.command(name='avatar', description='アバター')
-async def avatar_slash(interaction: discord.Interaction, user: discord.User = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f'{user.display_name}', color=0x2b2d31)
-    embed.set_image(url=user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
+@app.route('/')
+def health_check():
+    return "PRIM BOT API: Online", 200
 
-@bot.tree.command(name='web_auth', description='Webサイト用の認証トークンを取得します')
-async def web_auth_slash(interaction: discord.Interaction):
-    """Webサイト用認証トークンを生成してDMに送信"""
+# Discord OAuth2設定
+DISCORD_CLIENT_ID = os.getenv('DISCORD_CLIENT_ID', '')
+DISCORD_CLIENT_SECRET = os.getenv('DISCORD_CLIENT_SECRET', '')
+DISCORD_REDIRECT_URI = os.getenv('DISCORD_REDIRECT_URI', 'https://prim-store.pages.dev/callback.html')
+
+@app.route('/api/config')
+def get_config():
+    """Discord OAuth2設定を返す"""
+    return jsonify({
+        "discordClientId": DISCORD_CLIENT_ID
+    })
+
+@app.route('/api/auth/exchange', methods=['POST'])
+def exchange_code():
+    """認証コードをアクセストークンと交換"""
     try:
-        await interaction.response.defer(ephemeral=True)
+        data = request.get_json(silent=True) or {}
+        code = data.get('code')
         
-        # トークンを生成（bot2と同じロジック）
-        import secrets
-        import datetime
-        token = secrets.token_urlsafe(32)
+        if not code:
+            return jsonify({'success': False, 'error': '認証コードがありません'})
         
-        # トークン情報を保存（簡易版）
-        expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
+        # Discordにトークン交換リクエスト
+        token_url = 'https://discord.com/api/oauth2/token'
+        token_data = {
+            'client_id': DISCORD_CLIENT_ID,
+            'client_secret': DISCORD_CLIENT_SECRET,
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': DISCORD_REDIRECT_URI
+        }
         
-        # DMでトークンを送信
-        web_url = "file:///c%3A/Users/user/Videos/NVIDIA/Desktop/DiscordBot/DiscordServerWebStore/auth.html"
-        embed = discord.Embed(
-            title="🔐 Webサイト認証トークン",
-            description="以下のトークンをWebサイトで入力して認証してください。",
-            color=0x5865F2
-        )
-        embed.add_field(name="認証トークン", value=f"```\n{token}\n```", inline=False)
-        embed.add_field(name="Webサイト", value=f"[アクセスする]({web_url})", inline=False)
-        embed.add_field(name="有効期限", value="1時間", inline=True)
-        embed.set_footer(text="このトークンを共有しないでください")
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        token_response = requests.post(token_url, data=token_data, headers=headers, timeout=15)
         
-        try:
-            await interaction.user.send(embed=embed)
-            await interaction.followup.send("認証トークンをDMに送信しました。", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("DMを送信できませんでした。プライバシー設定を確認してください。", ephemeral=True)
-            
+        if token_response.status_code != 200:
+            return jsonify({'success': False, 'error': 'トークン交換に失敗しました'})
+        
+        token_info = token_response.json()
+        access_token = token_info.get('access_token')
+        
+        # ユーザー情報取得
+        user_url = 'https://discord.com/api/users/@me'
+        user_headers = {'Authorization': f'Bearer {access_token}'}
+        user_response = requests.get(user_url, headers=user_headers, timeout=15)
+        
+        if user_response.status_code != 200:
+            return jsonify({'success': False, 'error': 'ユーザー情報取得に失敗しました'})
+        
+        user_data = user_response.json()
+        
+        return jsonify({
+            'success': True,
+            'user': user_data,
+            'access_token': access_token
+        })
+        
     except Exception as e:
-        await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
+        return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/api/webhook-order', methods=['POST'])
+def handle_webstore_order():
+    """Webストアからの注文を受け取るエンドポイント"""
+    try:
+        data = request.get_json(silent=True) or {}
+        order_id = secrets.token_hex(8)
+        
+        # Botのイベントループを使用してDiscordにメッセージを送る
+        async def send_order_notice():
+            # ギルドを取得 (最初のギルドまたはID指定)
+            if not bot.guilds: return
+            guild = bot.guilds[0] 
+            
+            # 通知チャンネル取得
+            ch_id = get_paypay_notify_channel_id(guild.id)
+            if not ch_id: return
+            channel = bot.get_channel(ch_id)
+            if not channel: return
+
+            buyer_id = int(data.get('userId', 0))
+            items = data.get('items', [])
+            item_names = [f"{i['name']}{f' (Role: {i.get('roleId')})' if i.get('roleId') else ''}" for i in items]
+            
+            embed = discord.Embed(
+                title="🛒 Webストア受注 (PayPay)",
+                color=0x3B82F6,
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            embed.add_field(name="ユーザー", value=f"<@{buyer_id}> (`{buyer_id}`)", inline=False)
+            embed.add_field(name="商品", value="\n".join(item_names), inline=False)
+            embed.add_field(name="PayPayリンク", value=f"```{data.get('paypayLink')}```", inline=False)
+            embed.set_footer(text=f"Order ID: {order_id}")
+
+            view = AdminOrderView(order_id)
+            msg = await channel.send(embed=embed, view=view)
+            
+            # 注文データを保存 (bot.py の既存の仕組みを利用)
+            upsert_order(order_id, {
+                "guild_id": guild.id,
+                "channel_id": channel.id,
+                "message_id": msg.id,
+                "buyer_id": buyer_id,
+                "product_title": "Web Store Order",
+                "selected_option": ", ".join(item_names),
+                "status": "pending",
+                "buy_url": None
+            })
+
+        bot.loop.create_task(send_order_notice())
+        return jsonify({'success': True, 'orderId': order_id})
+    except Exception as e:
+        print(f"API Error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def start_auth_server():
+    """認証サーバーを起動"""
+    port = int(os.environ.get("PORT", 8000))
+    try:
+        from waitress import serve
+        print(f"🌐 Web API (waitress) listening on 0.0.0.0:{port}")
+        serve(app, host='0.0.0.0', port=port, threads=WAITRESS_THREADS)
+    except Exception as e:
+        print(f"⚠️ waitress起動に失敗。Flask開発サーバーへフォールバックします: {e}")
+        app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
+
+def start_auth_server_thread():
+    """認証サーバーをバックグラウンド起動"""
+    auth_server_thread = threading.Thread(target=start_auth_server, daemon=True)
+    auth_server_thread.start()
+    return auth_server_thread
 
 # ===== Botの起動 =====
 
+def run_bot_with_retry(token: str):
+    attempt = 0
+    while True:
+        try:
+            bot.run(token)
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            attempt += 1
+
+            if STARTUP_RETRY_LIMIT > 0 and attempt >= STARTUP_RETRY_LIMIT:
+                print(f"❌ 起動再試行の上限 ({STARTUP_RETRY_LIMIT}) に達しました: {e}")
+                raise
+
+            wait_seconds = min(STARTUP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), STARTUP_RETRY_MAX_SECONDS)
+            print(f"⚠️ Bot起動エラー: {e}")
+            print(f"⏳ {wait_seconds}秒待って再試行します ({attempt}回目)")
+            time.sleep(wait_seconds)
+
 if __name__ == '__main__':
-    token = os.getenv('DISCORD_TOKEN')
+    token = os.getenv('DISCORD_TOKEN') or os.getenv('DISCORD_TOKEN2')
     if not token:
-        print("❌ DISCORD_TOKEN が設定されていません。.env ファイルを確認してください。")
+        print("DISCORD_TOKEN / DISCORD_TOKEN2 が設定されていません。.env または Render env vars を確認してください。")
     else:
-        bot.run(token)
+        start_auth_server_thread()
+        run_bot_with_retry(token)
