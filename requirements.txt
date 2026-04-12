@@ -11,3 +11,6 @@ numpy
 pillow
 flask
 flask-cors
+waitress
+PyNaCl
+requests
