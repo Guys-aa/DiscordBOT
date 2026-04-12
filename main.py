@@ -53,6 +53,8 @@ STARTUP_RETRY_BASE_SECONDS = int(os.getenv("STARTUP_RETRY_BASE_SECONDS", "30"))
 STARTUP_RETRY_MAX_SECONDS = int(os.getenv("STARTUP_RETRY_MAX_SECONDS", "900"))  # 15分
 STARTUP_RETRY_LIMIT = int(os.getenv("STARTUP_RETRY_LIMIT", "0"))  # 0: 無制限
 WAITRESS_THREADS = int(os.getenv("WAITRESS_THREADS", "8"))
+ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "true").lower() in {"1", "true", "yes", "on"}
+ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "true").lower() in {"1", "true", "yes", "on"}
 
 
 def load_verify_role_ids():
@@ -621,8 +623,8 @@ class ProductView(discord.ui.View):
 
 # Botの設定
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+intents.message_content = ENABLE_MESSAGE_CONTENT_INTENT
+intents.members = ENABLE_MEMBERS_INTENT
 
 # プレフィックスコマンドとスラッシュコマンドの両方を使用
 bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "."), intents=intents, help_command=None)
@@ -632,6 +634,26 @@ persistent_views_registered = False
 
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def sanitize_discord_token(raw_token: str | None) -> str | None:
+    if raw_token is None:
+        return None
+    token = raw_token.strip()
+    if len(token) >= 2 and ((token[0] == '"' and token[-1] == '"') or (token[0] == "'" and token[-1] == "'")):
+        token = token[1:-1].strip()
+    return token or None
+
+
+def get_discord_token_from_env() -> tuple[str | None, str | None, bool]:
+    for env_name in ("DISCORD_TOKEN", "DISCORD_TOKEN2"):
+        raw_token = os.getenv(env_name)
+        if raw_token is None:
+            continue
+        token = sanitize_discord_token(raw_token)
+        token_was_normalized = token != raw_token
+        return env_name, token, token_was_normalized
+    return None, None, False
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -1468,6 +1490,14 @@ def run_bot_with_retry(token: str):
             return
         except KeyboardInterrupt:
             raise
+        except discord.LoginFailure:
+            print("❌ Discordログイン失敗: トークンが無効です。Renderの環境変数 DISCORD_TOKEN を再発行して設定してください。")
+            raise
+        except discord.PrivilegedIntentsRequired:
+            print("❌ Privileged Intents が未有効です。Discord Developer Portal > Bot で")
+            print("   MESSAGE CONTENT INTENT と SERVER MEMBERS INTENT をONにしてください。")
+            print("   使わない場合は ENABLE_MESSAGE_CONTENT_INTENT=false / ENABLE_MEMBERS_INTENT=false で起動可能です。")
+            raise
         except Exception as e:
             attempt += 1
 
@@ -1481,7 +1511,16 @@ def run_bot_with_retry(token: str):
             time.sleep(wait_seconds)
 
 if __name__ == '__main__':
-    token = os.getenv('DISCORD_TOKEN') or os.getenv('DISCORD_TOKEN2')
+    token_env_name, token, token_was_normalized = get_discord_token_from_env()
+    if not token:
+        print("DISCORD_TOKEN / DISCORD_TOKEN2 が未設定、または値が空です。.env または Render env vars を確認してください。")
+    else:
+        print(f"🔑 {token_env_name} を使用して起動します。")
+        if token_was_normalized:
+            print(f"ℹ️ {token_env_name} の前後空白/引用符を除去して使用します。")
+        print(f"ℹ️ intents: message_content={ENABLE_MESSAGE_CONTENT_INTENT}, members={ENABLE_MEMBERS_INTENT}")
+        start_auth_server_thread()
+        run_bot_with_retry(token)
     if not token:
         print("DISCORD_TOKEN / DISCORD_TOKEN2 が設定されていません。.env または Render env vars を確認してください。")
     else:
